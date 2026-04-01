@@ -1,25 +1,19 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const webpush = require('web-push');
 require('dotenv').config();
 
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
 // Health check
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ============================================
-// 1. FIREBASE ADMIN SDK
-// ============================================
+// Firebase Admin
 let db;
-
 try {
     if (process.env.FIREBASE_PRIVATE_KEY) {
         admin.initializeApp({
@@ -31,143 +25,127 @@ try {
         });
         db = admin.firestore();
         console.log('✅ Firebase Admin SDK инициализиран');
-    } else {
-        console.warn('⚠️ Firebase не е конфигуриран');
-        db = null;
     }
 } catch (error) {
-    console.error('❌ Грешка при Firebase:', error.message);
-    db = null;
+    console.error('Firebase error:', error.message);
 }
 
-// ============================================
-// 2. WEB PUSH (VAPID)
-// ============================================
-if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-    webpush.setVapidDetails(
-        'mailto:' + (process.env.VAPID_EMAIL || 'admin@ai-assistant.com'),
-        process.env.VAPID_PUBLIC_KEY,
-        process.env.VAPID_PRIVATE_KEY
-    );
-    console.log('✅ Web Push инициализиран');
-} else {
-    console.warn('⚠️ VAPID ключове не са конфигурирани');
-}
-
-// ============================================
-// 3. API ENDPOINTS
-// ============================================
-
-// Запазване на FCM токен
+// Subscribe - запазва FCM токен
 app.post('/api/subscribe', async (req, res) => {
     const { token, userId = 'default' } = req.body;
     
     if (!token) {
-        return res.status(400).json({ error: 'Token is required' });
+        return res.status(400).json({ error: 'Token required' });
     }
     
     try {
         if (db) {
             await db.collection('subscriptions').doc(userId).set({
-                token: token,
+                fcmToken: token,
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
-            console.log(`✅ Токен запазен: ${token.substring(0, 30)}...`);
-        } else {
-            console.log(`📝 Mock mode - token: ${token.substring(0, 30)}...`);
         }
-        
-        res.json({ success: true, message: 'Subscribed successfully' });
+        console.log('✅ FCM Token запазен:', token.substring(0, 50) + '...');
+        res.json({ success: true });
     } catch (error) {
-        console.error('❌ Грешка:', error);
+        console.error('Error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Изпращане на въпрос
+// Ask - изпраща въпрос чрез FCM
 app.post('/api/ask', async (req, res) => {
     const { question } = req.body;
     
     if (!question) {
-        return res.status(400).json({ error: 'Question is required' });
+        return res.status(400).json({ error: 'Question required' });
     }
     
     try {
+        // Вземи всички FCM токени
         let tokens = [];
-        
         if (db) {
             const snapshot = await db.collection('subscriptions').get();
-            tokens = snapshot.docs.map(doc => doc.data().token).filter(t => t);
+            tokens = snapshot.docs.map(doc => doc.data().fcmToken).filter(t => t);
         }
         
         if (tokens.length === 0) {
             return res.status(404).json({ error: 'No subscribers found' });
         }
         
-        const payload = JSON.stringify({
-            title: '🤖 AI Assistant',
-            body: question,
+        console.log(`📤 Изпращане до ${tokens.length} устройства...`);
+        
+        // Създай съобщението
+        const message = {
+            notification: {
+                title: '🤖 AI Assistant',
+                body: question,
+            },
             data: {
                 question: question,
-                questionId: Date.now().toString()
-            }
-        });
+                questionId: Date.now().toString(),
+            },
+            tokens: tokens
+        };
         
-        let successCount = 0;
+        // Изпрати чрез Firebase Admin SDK
+        const response = await admin.messaging().sendEachForMulticast(message);
         
-        for (const token of tokens) {
-            try {
-                const subscription = {
-                    endpoint: token,
-                    keys: { auth: '', p256dh: '' }
-                };
-                
-                await webpush.sendNotification(subscription, payload);
-                successCount++;
-                console.log(`✅ Изпратено до: ${token.substring(0, 30)}...`);
-            } catch (err) {
-                console.error(`❌ Грешка: ${err.message}`);
-            }
+        console.log(`📤 Изпратени: ${response.successCount} успешни, ${response.failureCount} неуспешни`);
+        
+        // Лог на грешките
+        if (response.failureCount > 0) {
+            response.responses.forEach((resp, idx) => {
+                if (!resp.success) {
+                    console.error(`Грешка за токен ${idx}:`, resp.error);
+                }
+            });
         }
         
-        res.json({ success: true, sent: successCount, total: tokens.length });
+        res.json({ 
+            success: true, 
+            sent: response.successCount, 
+            total: tokens.length 
+        });
     } catch (error) {
-        console.error('❌ Грешка:', error);
+        console.error('Error sending message:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Получаване на отговор
+// Answer - получава отговор
 app.post('/api/answer', async (req, res) => {
     const { answer, questionId, token, userId } = req.body;
     
     console.log(`📝 Отговор от ${userId || 'anonymous'}: "${answer}"`);
     
-    // AI логика
     const lowerAnswer = answer?.toLowerCase() || '';
     
-    if (lowerAnswer.includes('да') || lowerAnswer.includes('yes')) {
-        console.log('🎯 ДЕЙСТВИЕ: Включвам отоплението!');
+    if (lowerAnswer.includes('да')) {
+        console.log('🎯 ДЕЙСТВИЕ: Включвам отоплението! 🔥');
         
-        // Изпрати потвърждение
-        if (token && webpush) {
-            const confirmPayload = JSON.stringify({
-                title: '✅ Действие изпълнено',
-                body: 'Включвам отоплението! 🔥',
-                data: { action: 'heating_on' }
-            });
+        // Изпрати потвърждение обратно
+        if (token) {
+            const confirmMessage = {
+                notification: {
+                    title: '✅ Действие изпълнено',
+                    body: 'Включвам отоплението! 🔥',
+                },
+                data: {
+                    action: 'heating_on',
+                    status: 'success'
+                },
+                token: token
+            };
             
             try {
-                const subscription = {
-                    endpoint: token,
-                    keys: { auth: '', p256dh: '' }
-                };
-                await webpush.sendNotification(subscription, confirmPayload);
+                await admin.messaging().send(confirmMessage);
+                console.log('✅ Потвърждение изпратено');
             } catch (err) {
                 console.error('Грешка при потвърждение:', err.message);
             }
         }
-    } else if (lowerAnswer.includes('не') || lowerAnswer.includes('no')) {
+    } else if (lowerAnswer.includes('не')) {
         console.log('ℹ️ ДЕЙСТВИЕ: Нищо не правя');
     }
     
@@ -185,14 +163,14 @@ app.post('/api/answer', async (req, res) => {
         }
     }
     
-    res.json({ success: true, message: 'Answer received' });
+    res.json({ success: true });
 });
 
-// Root endpoint
+// Root
 app.get('/', (req, res) => {
     res.json({
-        name: 'AI Assistant Backend',
-        version: '1.0.0',
+        name: 'Notifications Backend',
+        version: '2.0.0',
         status: 'running',
         endpoints: ['/health', '/api/subscribe', '/api/ask', '/api/answer']
     });
