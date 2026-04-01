@@ -1,4 +1,3 @@
-cat > package.json << 'EOF'
 {
   "name": "notifications-backend",
   "version": "1.0.0",
