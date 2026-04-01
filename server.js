@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health check за Render
+// Health check
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -21,7 +21,6 @@ app.get('/health', (req, res) => {
 let db;
 
 try {
-    // Проверка дали сме в production (Render) или development
     if (process.env.FIREBASE_PRIVATE_KEY) {
         admin.initializeApp({
             credential: admin.credential.cert({
@@ -33,19 +32,12 @@ try {
         db = admin.firestore();
         console.log('✅ Firebase Admin SDK инициализиран');
     } else {
-        console.warn('⚠️ Firebase не е конфигуриран, използвам mock режим');
-        db = {
-            collection: () => ({
-                doc: () => ({
-                    set: async () => console.log('Mock: saving token'),
-                    get: async () => ({ exists: false, data: () => null })
-                }),
-                get: async () => ({ docs: [], empty: true })
-            })
-        };
+        console.warn('⚠️ Firebase не е конфигуриран');
+        db = null;
     }
 } catch (error) {
     console.error('❌ Грешка при Firebase:', error.message);
+    db = null;
 }
 
 // ============================================
@@ -66,7 +58,7 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 // 3. API ENDPOINTS
 // ============================================
 
-// Запазване на FCM токен от клиента
+// Запазване на FCM токен
 app.post('/api/subscribe', async (req, res) => {
     const { token, userId = 'default' } = req.body;
     
@@ -75,15 +67,16 @@ app.post('/api/subscribe', async (req, res) => {
     }
     
     try {
-        if (db && !db.isDummy) {
+        if (db) {
             await db.collection('subscriptions').doc(userId).set({
                 token: token,
-                endpoint: token,
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
+            console.log(`✅ Токен запазен: ${token.substring(0, 30)}...`);
+        } else {
+            console.log(`📝 Mock mode - token: ${token.substring(0, 30)}...`);
         }
         
-        console.log(`✅ Токен запазен за user: ${userId}`);
         res.json({ success: true, message: 'Subscribed successfully' });
     } catch (error) {
         console.error('❌ Грешка:', error);
@@ -91,7 +84,7 @@ app.post('/api/subscribe', async (req, res) => {
     }
 });
 
-// Изпращане на въпрос до всички потребители
+// Изпращане на въпрос
 app.post('/api/ask', async (req, res) => {
     const { question } = req.body;
     
@@ -102,8 +95,7 @@ app.post('/api/ask', async (req, res) => {
     try {
         let tokens = [];
         
-        // Вземи всички токени от Firestore
-        if (db && !db.isDummy) {
+        if (db) {
             const snapshot = await db.collection('subscriptions').get();
             tokens = snapshot.docs.map(doc => doc.data().token).filter(t => t);
         }
@@ -125,89 +117,75 @@ app.post('/api/ask', async (req, res) => {
         
         for (const token of tokens) {
             try {
-                // За FCM token трябва да е във формат { endpoint, keys }
-                // За опростяване, тук приемаме че token е endpoint
                 const subscription = {
                     endpoint: token,
-                    keys: {
-                        auth: '',
-                        p256dh: ''
-                    }
+                    keys: { auth: '', p256dh: '' }
                 };
                 
                 await webpush.sendNotification(subscription, payload);
                 successCount++;
-                console.log(`✅ Изпратено до: ${token.substring(0, 20)}...`);
+                console.log(`✅ Изпратено до: ${token.substring(0, 30)}...`);
             } catch (err) {
-                console.error(`❌ Грешка за токен ${token.substring(0, 20)}...:`, err.message);
+                console.error(`❌ Грешка: ${err.message}`);
             }
         }
         
         res.json({ success: true, sent: successCount, total: tokens.length });
     } catch (error) {
-        console.error('❌ Грешка при изпращане:', error);
+        console.error('❌ Грешка:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Получаване на отговор от потребителя
+// Получаване на отговор
 app.post('/api/answer', async (req, res) => {
     const { answer, questionId, token, userId } = req.body;
     
-    console.log(`📝 Отговор от ${userId || 'anonymous'}: "${answer}" на въпрос ${questionId}`);
+    console.log(`📝 Отговор от ${userId || 'anonymous'}: "${answer}"`);
     
-    // 🔥 AI ЛОГИКАТА Е ТУК
-    try {
-        const lowerAnswer = answer?.toLowerCase() || '';
+    // AI логика
+    const lowerAnswer = answer?.toLowerCase() || '';
+    
+    if (lowerAnswer.includes('да') || lowerAnswer.includes('yes')) {
+        console.log('🎯 ДЕЙСТВИЕ: Включвам отоплението!');
         
-        if (lowerAnswer.includes('да') || lowerAnswer.includes('yes')) {
-            console.log('🎯 ДЕЙСТВИЕ: Потребителят каза ДА!');
+        // Изпрати потвърждение
+        if (token && webpush) {
+            const confirmPayload = JSON.stringify({
+                title: '✅ Действие изпълнено',
+                body: 'Включвам отоплението! 🔥',
+                data: { action: 'heating_on' }
+            });
             
-            // Тук добави каквото действие искаш:
-            // - Включи отопление
-            // - Изпрати SMS
-            // - Запази в календар
-            // - Изпрати email и т.н.
-            
-            // Пример: Изпрати потвърждение обратно
-            if (token) {
-                const confirmPayload = JSON.stringify({
-                    title: '✅ Действие изпълнено',
-                    body: 'Разбрах, че се прибираш. Включвам отоплението! 🔥',
-                    data: { action: 'heating_on', status: 'success' }
-                });
-                
-                try {
-                    const subscription = {
-                        endpoint: token,
-                        keys: { auth: '', p256dh: '' }
-                    };
-                    await webpush.sendNotification(subscription, confirmPayload);
-                } catch (err) {
-                    console.error('Грешка при потвърждение:', err.message);
-                }
+            try {
+                const subscription = {
+                    endpoint: token,
+                    keys: { auth: '', p256dh: '' }
+                };
+                await webpush.sendNotification(subscription, confirmPayload);
+            } catch (err) {
+                console.error('Грешка при потвърждение:', err.message);
             }
-        } else if (lowerAnswer.includes('не') || lowerAnswer.includes('no')) {
-            console.log('ℹ️ ДЕЙСТВИЕ: Потребителят каза НЕ, нищо не правя');
-        } else {
-            console.log(`🤔 Неразпознат отговор: "${answer}"`);
         }
-        
-        // Запази отговора в базата (ако има Firestore)
-        if (db && !db.isDummy) {
+    } else if (lowerAnswer.includes('не') || lowerAnswer.includes('no')) {
+        console.log('ℹ️ ДЕЙСТВИЕ: Нищо не правя');
+    }
+    
+    // Запази отговора
+    if (db) {
+        try {
             await db.collection('responses').add({
                 answer: answer,
                 questionId: questionId,
                 userId: userId || 'anonymous',
                 timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
+        } catch (err) {
+            console.error('Грешка при запис:', err.message);
         }
-        
-        res.json({ success: true, message: 'Answer received' });
-    } catch (error) {
-        console.error('❌ Грешка при обработка:', error);
-        res.status(500).json({ error: error.message });
     }
+    
+    res.json({ success: true, message: 'Answer received' });
 });
 
 // Root endpoint
@@ -220,11 +198,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// ============================================
-// 4. СТАРТИРАНЕ
-// ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📍 Health check: http://localhost:${PORT}/health`);
 });
